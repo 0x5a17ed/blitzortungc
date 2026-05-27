@@ -42,10 +42,18 @@ type Dialer interface {
 	Dial(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error)
 }
 
+// UserAgent is the User-Agent header DefaultDialer sends on the
+// WebSocket upgrade request. Override it at init time to identify
+// your application to the upstream service. Custom Dialer
+// implementations are responsible for setting their own header.
+var UserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
 // DefaultDialer is the Dialer used when none is configured: it calls
-// websocket.Dial with no options.
+// websocket.Dial with the package-level UserAgent applied.
 var DefaultDialer Dialer = dialerFunc(func(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error) {
-	return websocket.Dial(ctx, urlStr, nil)
+	return websocket.Dial(ctx, urlStr, &websocket.DialOptions{
+		HTTPHeader: http.Header{"User-Agent": []string{UserAgent}},
+	})
 })
 
 type dialerFunc func(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error)
