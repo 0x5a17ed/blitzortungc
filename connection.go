@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -98,10 +99,14 @@ func (r *runner) runReadLoop() error {
 
 	r.wsConn.SetPingHandler(func(m string) error {
 		r.rearmPingTimer()
-		r.writeCh <- func() error {
-			return r.writeControl(websocket.PongMessage, []byte(m))
+		err := r.writeControl(websocket.PongMessage, []byte(m))
+		if err == websocket.ErrCloseSent {
+			return nil
 		}
-		return nil
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return nil
+		}
+		return err
 	})
 
 	for {
