@@ -31,9 +31,16 @@ import (
 	"github.com/0x5a17ed/blitzortungc/internal/atomicval"
 )
 
+var (
+	pickServerMu  sync.Mutex
+	pickServerRng = rand.New(rand.NewSource(time.Now().UnixNano()))
+)
+
 func pickServer() string {
 	l := []string{"ws1.blitzortung.org", "ws7.blitzortung.org", "ws8.blitzortung.org"}
-	return l[rand.Intn(len(l))]
+	pickServerMu.Lock()
+	defer pickServerMu.Unlock()
+	return l[pickServerRng.Intn(len(l))]
 }
 
 // Client represents a client for the service of https://www.blitzortung.org/en/ for
