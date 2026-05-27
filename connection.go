@@ -104,7 +104,6 @@ func (r *runner) runReadLoop() error {
 		return nil
 	})
 
-	var val Strike
 	for {
 		if err := r.wsConn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
 			return err
@@ -118,7 +117,8 @@ func (r *runner) runReadLoop() error {
 			r.rearmPingTimer()
 
 			inflated := Inflate(data)
-			if err := json.Unmarshal(inflated, &val); err != nil {
+			val := &Strike{}
+			if err := json.Unmarshal(inflated, val); err != nil {
 				r.notifyError(&UnmarshalError{
 					Wrapped: err,
 					RawData: inflated,
@@ -126,7 +126,7 @@ func (r *runner) runReadLoop() error {
 				continue
 			}
 
-			r.handler.HandleStrike(&val)
+			r.handler.HandleStrike(val)
 		}
 	}
 }
