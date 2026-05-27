@@ -16,48 +16,97 @@
 package blitzortungc
 
 import (
+	"fmt"
 	"unicode/utf8"
 )
 
-func concatBytes(a, b []byte) []byte { return append(append([]byte(nil), a...), b...) }
-
-func Inflate(d []byte) (out []byte) {
+// Inflate decodes the LZW-style UTF-8 stream the upstream service
+// uses for its strike messages. Codes are encoded as UTF-8 runes:
+// runes below 256 emit themselves as a single byte, and runes from
+// 256 upward index a dictionary that grows as the stream is consumed,
+// with the standard KωK edge case for codes that reference the entry
+// about to be defined.
+//
+// Returns an error if d contains an invalid UTF-8 byte sequence.
+func Inflate(d []byte) ([]byte, error) {
 	if len(d) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	var c [8]byte
-	var cl int
-	_, cl = utf8.DecodeRune(d[:])
-	copy(c[:], d[:cl])
+	const dictStart = 256
 
-	f := d[:cl]
+	// Decode the seed rune. It becomes the first output bytes and
+	// the initial value of f (the "previous entry") used to build
+	// dictionary entries.
+	seed, seedLen := utf8.DecodeRune(d)
+	if seed == utf8.RuneError && seedLen <= 1 {
+		return nil, fmt.Errorf("blitzortungc inflate: invalid UTF-8 at offset 0")
+	}
 
-	out = make([]byte, cl, len(d))
-	copy(out, d[:cl])
+	// Output buffer. Decompressed payloads are always at least as
+	// large as the input and typically larger; 2× is a heuristic that
+	// avoids most reallocations without obviously overshooting. append
+	// grows geometrically beyond this if the heuristic is too tight.
+	out := make([]byte, 0, max(len(d)*2, 64))
+	out = append(out, d[:seedLen]...)
 
-	m := make([][]byte, 256, 256+len(d))
+	// Dictionary entries reference byte ranges in out via (offset,
+	// length). Storing offsets rather than slices keeps the references
+	// stable across reallocations of the output buffer. The first 256
+	// codes are reserved for literal bytes, so dict[0] holds the
+	// entry for rune 256 (the first dictionary entry).
+	type entry struct{ off, length int }
+	dict := make([]entry, 0, 64)
 
-	for off := cl; off < len(d); {
+	// f tracks the previous decoded entry as (offset, length) into out.
+	fOff, fLen := 0, seedLen
+
+	for off := seedLen; off < len(d); {
 		r, w := utf8.DecodeRune(d[off:])
+		if r == utf8.RuneError && w <= 1 {
+			return nil, fmt.Errorf("blitzortungc inflate: invalid UTF-8 at offset %d", off)
+		}
 
-		var a []byte
-		if r <= 0xff {
-			a = d[off : off+w]
-		} else if int(r) < len(m) {
-			a = m[r]
-		} else {
-			a = concatBytes(f, c[:cl])
+		// Resolve the current code to a byte range in out, appending
+		// the bytes as a side effect. aOff is the start of the
+		// appended range; the invariant aOff == fOff + fLen holds
+		// because each iteration appends exactly the new entry to
+		// the end of out.
+		var aOff, aLen int
+		switch {
+		case int(r) < dictStart:
+			// Literal: a single UTF-8 rune below 256 emits the
+			// corresponding input bytes verbatim.
+			aOff = len(out)
+			out = append(out, d[off:off+w]...)
+			aLen = w
+		case int(r)-dictStart < len(dict):
+			e := dict[int(r)-dictStart]
+			aOff = len(out)
+			out = append(out, out[e.off:e.off+e.length]...)
+			aLen = e.length
+		default:
+			// KωK: the code references the entry about to be
+			// defined. The decoded bytes are f + first_rune_of_f,
+			// which we append to out in two steps. Between the
+			// appends, out may have grown; fOff remains a valid
+			// index into the (possibly new) backing array.
+			_, fFirstRuneLen := utf8.DecodeRune(out[fOff:])
+			aOff = len(out)
+			out = append(out, out[fOff:fOff+fLen]...)
+			out = append(out, out[fOff:fOff+fFirstRuneLen]...)
+			aLen = fLen + fFirstRuneLen
 		}
 		off += w
 
-		out = append(out, a...)
+		// Define the next dictionary entry: f + first_rune_of_a.
+		// By the aOff == fOff + fLen invariant, those bytes are
+		// already contiguous in out at [fOff : fOff + fLen +
+		// aFirstRuneLen], so no copy is needed.
+		_, aFirstRuneLen := utf8.DecodeRune(out[aOff:])
+		dict = append(dict, entry{off: fOff, length: fLen + aFirstRuneLen})
 
-		r, _ = utf8.DecodeRune(a)
-		cl = utf8.EncodeRune(c[:], r)
-		m = append(m, concatBytes(f, c[:cl]))
-
-		f = a
+		fOff, fLen = aOff, aLen
 	}
-	return
+	return out, nil
 }

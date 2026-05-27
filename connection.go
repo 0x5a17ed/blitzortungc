@@ -82,7 +82,11 @@ func (r *runner) runReadLoop(ctx context.Context) error {
 		}
 		r.markTraffic()
 
-		inflated := Inflate(data)
+		inflated, err := Inflate(data)
+		if err != nil {
+			r.notifyError(&InflateError{Wrapped: err, RawData: data})
+			continue
+		}
 		val := &Strike{}
 		if err := json.Unmarshal(inflated, val); err != nil {
 			r.notifyError(&UnmarshalError{
