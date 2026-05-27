@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"go.uber.org/multierr"
 
 	"github.com/0x5a17ed/blitzortungc/internal/atomicval"
 )
@@ -166,23 +165,26 @@ func (r *runner) notifyError(err error) {
 
 // shutdown shuts the client down cleanly.
 func (r *runner) shutdown() {
-	r.writeCh <- func() error {
-		// Cleanly close the connection by sending a close message and then
-		// wait (with timeout) for the server to close the connection.
-		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-		if err := r.writeControl(websocket.CloseMessage, closeMsg); err != nil {
-			// Informing the server that the connection is about
-			// to be closed gracefully failed, just close the
-			// underlying connection.
-			return multierr.Append(err, r.wsConn.Close())
-		}
+	// Cleanly close the connection by sending a close message and then
+	// wait (with timeout) for the server to close the connection. The
+	// close frame is written directly: WriteControl is concurrency-safe
+	// with other writers, so we don't need to round-trip through the
+	// write loop (which may already have exited).
+	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+	if err := r.writeControl(websocket.CloseMessage, closeMsg); err != nil {
+		// Sending the close frame failed; force the conn shut so the
+		// read loop unblocks and the write loop can exit.
+		_ = r.wsConn.Close()
+		return
+	}
 
-		select {
-		case err := <-r.errorCh:
-			return err
-		case <-time.After(2 * time.Second):
-			return r.wsConn.Close()
-		}
+	// Wait for the server's close ack (which surfaces as the read loop
+	// terminating and feeding errorCh) or time out. errorCh is buffered
+	// and closed by the read goroutine, so this receive always returns.
+	select {
+	case <-r.errorCh:
+	case <-time.After(2 * time.Second):
+		_ = r.wsConn.Close()
 	}
 }
 
