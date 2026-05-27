@@ -1,6 +1,6 @@
 module github.com/0x5a17ed/blitzortungc
 
-go 1.18
+go 1.24
 
 require (
 	github.com/cenkalti/backoff/v4 v4.1.3
