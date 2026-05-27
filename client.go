@@ -18,29 +18,21 @@ package blitzortungc
 import (
 	"context"
 	"errors"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/gorilla/websocket"
 	"go.uber.org/multierr"
-
-	"github.com/0x5a17ed/blitzortungc/internal/atomicval"
-)
-
-var (
-	pickServerMu  sync.Mutex
-	pickServerRng = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 func pickServer() string {
-	l := []string{"ws1.blitzortung.org", "ws7.blitzortung.org", "ws8.blitzortung.org"}
-	pickServerMu.Lock()
-	defer pickServerMu.Unlock()
-	return l[pickServerRng.Intn(len(l))]
+	l := []string{"ws1.blitzortung.org", "ws2.blitzortung.org", "ws7.blitzortung.org", "ws8.blitzortung.org"}
+	return l[rand.IntN(len(l))]
 }
 
 // Client represents a client for the service of https://www.blitzortung.org/en/ for
@@ -54,7 +46,7 @@ type Client struct {
 	ErrorHook func(error)
 
 	backOff *backoff.ExponentialBackOff
-	runner  atomicval.AtomicValue[*runner]
+	runner  atomic.Pointer[runner]
 
 	m              sync.Mutex
 	isShuttingDown bool
@@ -86,7 +78,7 @@ func (c *Client) runOnce(ctx context.Context, dialer Dialer) (err error) {
 	}
 	defer multierr.AppendInvoke(&err, multierr.Close(wc))
 
-	if err := wc.WriteJSON(map[string]int{"a": 542}); err != nil {
+	if err := wc.WriteJSON(map[string]int{"a": 111}); err != nil {
 		return err
 	}
 

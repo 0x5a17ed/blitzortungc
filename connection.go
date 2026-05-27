@@ -20,11 +20,10 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-
-	"github.com/0x5a17ed/blitzortungc/internal/atomicval"
 )
 
 const (
@@ -59,7 +58,10 @@ type runner struct {
 	writeCh chan messageWriter // writeCh is used to serialize writes to the websocket from goroutines.
 	errorCh chan error
 
-	nextPing atomicval.AtomicValue[time.Time] // Last message or pong received from the server.
+	// nextPingUnixNano is the deadline (as Unix nanoseconds) at which
+	// the next keepalive ping should be issued if no traffic arrives
+	// before then.
+	nextPingUnixNano atomic.Int64
 }
 
 func (r *runner) writeControl(mType int, data []byte) error {
@@ -68,13 +70,13 @@ func (r *runner) writeControl(mType int, data []byte) error {
 
 // rearmPingTimer sets the next ping attempt to pingPeriod time in the future.
 func (r *runner) rearmPingTimer() {
-	r.nextPing.Store(time.Now().Add(pingPeriod))
+	r.nextPingUnixNano.Store(time.Now().Add(pingPeriod).UnixNano())
 }
 
 // checkPing checks whenever the connection has been stale for too long
 // and checks if the server is still reachable in case.
 func (r *runner) checkPing() error {
-	if time.Now().Before(r.nextPing.Load()) {
+	if time.Now().UnixNano() < r.nextPingUnixNano.Load() {
 		return nil
 	}
 
