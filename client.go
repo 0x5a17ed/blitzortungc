@@ -18,6 +18,7 @@ package blitzortungc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -27,17 +28,32 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/coder/websocket"
+
+	"github.com/0x5a17ed/blitzortungc/internal/upstream"
 )
 
-func pickServer() string {
-	l := []string{"ws1.blitzortung.org", "ws2.blitzortung.org", "ws7.blitzortung.org", "ws8.blitzortung.org"}
-	return l[rand.IntN(len(l))]
-}
+// Baked-in fallback values, used when remote config is disabled or
+// fails. Kept in sync with the upstream JS by hand.
+var (
+	defaultServers = []string{
+		"ws1.blitzortung.org",
+		"ws2.blitzortung.org",
+		"ws7.blitzortung.org",
+		"ws8.blitzortung.org",
+	}
+	defaultSubscribePayload = []byte(`{"a":111}`)
+)
+
+// remoteConfigTimeout bounds the per-call duration of the upstream JS
+// fetch on Run startup. It must complete before the WebSocket connect
+// is attempted, so keep it short enough that a slow CDN doesn't stall
+// the whole client.
+const remoteConfigTimeout = 10 * time.Second
 
 // Dialer establishes the underlying WebSocket connection. Provide a
 // custom implementation to inject HTTP headers, a custom HTTP client,
 // or to mock the transport in tests. DefaultDialer dials with
-// websocket.Dial and zero options.
+// websocket.Dial and the package-level UserAgent applied.
 type Dialer interface {
 	Dial(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error)
 }
@@ -72,8 +88,23 @@ type Client struct {
 	// processing server data.
 	ErrorHook func(error)
 
+	// DisableRemoteConfig disables fetching the live server list and
+	// subscribe payload from blitzortung.org's JS at Run start. With
+	// it set, the baked-in defaults are used unconditionally.
+	DisableRemoteConfig bool
+
+	// HTTPClient is used to fetch the upstream JS for remote config.
+	// If nil, http.DefaultClient is used. Ignored when
+	// DisableRemoteConfig is true.
+	HTTPClient *http.Client
+
 	backOff *backoff.ExponentialBackOff
 	runner  atomic.Pointer[runner]
+
+	// Resolved at Run start from upstream.Fetch (or the baked-in
+	// defaults on failure / when remote config is disabled).
+	servers          []string
+	subscribePayload []byte
 
 	m              sync.Mutex
 	isShuttingDown bool
@@ -92,8 +123,34 @@ func (c *Client) getIsShuttingDown() bool {
 	return c.isShuttingDown
 }
 
+func (c *Client) pickServer() string {
+	return c.servers[rand.IntN(len(c.servers))]
+}
+
+// resolveConfig populates c.servers and c.subscribePayload, preferring
+// the values extracted from upstream JS over the baked-in defaults.
+// Failures are surfaced via ErrorHook but never block startup.
+func (c *Client) resolveConfig(ctx context.Context) {
+	c.servers = defaultServers
+	c.subscribePayload = defaultSubscribePayload
+	if c.DisableRemoteConfig {
+		return
+	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, remoteConfigTimeout)
+	defer cancel()
+
+	cfg, err := upstream.Fetch(fetchCtx, c.HTTPClient, UserAgent)
+	if err != nil {
+		c.notifyError(fmt.Errorf("remote config: %w", err))
+		return
+	}
+	c.servers = cfg.Servers
+	c.subscribePayload = cfg.SubscribePayload
+}
+
 func (c *Client) runOnce(ctx context.Context, dialer Dialer) (err error) {
-	u := url.URL{Scheme: "wss", Host: pickServer(), Path: "/"}
+	u := url.URL{Scheme: "wss", Host: c.pickServer(), Path: "/"}
 
 	conn, _, err := dialer.Dial(ctx, u.String())
 	if err != nil {
@@ -102,7 +159,7 @@ func (c *Client) runOnce(ctx context.Context, dialer Dialer) (err error) {
 	defer func() { _ = conn.CloseNow() }()
 
 	subscribeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = subscribe(subscribeCtx, conn)
+	err = conn.Write(subscribeCtx, websocket.MessageText, c.subscribePayload)
 	cancel()
 	if err != nil {
 		return err
@@ -124,13 +181,6 @@ func (c *Client) runOnce(ctx context.Context, dialer Dialer) (err error) {
 		}
 	}
 	return nil
-}
-
-// subscribe sends the initial subscription frame the upstream service
-// expects after the WebSocket handshake.
-func subscribe(ctx context.Context, conn *websocket.Conn) error {
-	const payload = `{"a":111}`
-	return conn.Write(ctx, websocket.MessageText, []byte(payload))
 }
 
 // Shutdown shuts the client down cleanly and prevents it from
@@ -156,6 +206,7 @@ func (c *Client) Run(ctx context.Context, dialer Dialer) error {
 		dialer = DefaultDialer
 	}
 	c.backOff = backoff.NewExponentialBackOff()
+	c.resolveConfig(ctx)
 
 	return backoff.RetryNotify(func() error {
 		return c.runOnce(ctx, dialer)
