@@ -189,6 +189,7 @@ func newRunner(wsConn wsConn, handler Handler, errorFn errorFn) *runner {
 		writeCh: make(chan messageWriter),
 		errorCh: make(chan error),
 	}
+	c.rearmPingTimer()
 
 	go func() {
 		defer close(c.errorCh)
