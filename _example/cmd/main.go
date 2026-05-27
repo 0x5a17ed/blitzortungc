@@ -22,9 +22,9 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/0x5a17ed/blitzortungc"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/gorilla/websocket"
+
+	"github.com/0x5a17ed/blitzortungc"
 )
 
 func main() {
@@ -64,7 +64,7 @@ func main() {
 		},
 	}
 
-	if err := c.Run(ctx, websocket.DefaultDialer); err != nil {
+	if err := c.Run(ctx, blitzortungc.DefaultDialer); err != nil {
 		fmt.Printf("error: %s\n", err.Error())
 	}
 

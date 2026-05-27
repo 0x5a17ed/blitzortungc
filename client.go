@@ -26,13 +26,32 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/gorilla/websocket"
-	"go.uber.org/multierr"
+	"github.com/coder/websocket"
 )
 
 func pickServer() string {
 	l := []string{"ws1.blitzortung.org", "ws2.blitzortung.org", "ws7.blitzortung.org", "ws8.blitzortung.org"}
 	return l[rand.IntN(len(l))]
+}
+
+// Dialer establishes the underlying WebSocket connection. Provide a
+// custom implementation to inject HTTP headers, a custom HTTP client,
+// or to mock the transport in tests. DefaultDialer dials with
+// websocket.Dial and zero options.
+type Dialer interface {
+	Dial(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error)
+}
+
+// DefaultDialer is the Dialer used when none is configured: it calls
+// websocket.Dial with no options.
+var DefaultDialer Dialer = dialerFunc(func(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error) {
+	return websocket.Dial(ctx, urlStr, nil)
+})
+
+type dialerFunc func(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error)
+
+func (f dialerFunc) Dial(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error) {
+	return f(ctx, urlStr)
 }
 
 // Client represents a client for the service of https://www.blitzortung.org/en/ for
@@ -65,39 +84,45 @@ func (c *Client) getIsShuttingDown() bool {
 	return c.isShuttingDown
 }
 
-type Dialer interface {
-	DialContext(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error)
-}
-
 func (c *Client) runOnce(ctx context.Context, dialer Dialer) (err error) {
 	u := url.URL{Scheme: "wss", Host: pickServer(), Path: "/"}
 
-	wc, _, err := dialer.DialContext(ctx, u.String(), nil)
+	conn, _, err := dialer.Dial(ctx, u.String())
 	if err != nil {
 		return err
 	}
-	defer multierr.AppendInvoke(&err, multierr.Close(wc))
+	defer func() { _ = conn.CloseNow() }()
 
-	if err := wc.WriteJSON(map[string]int{"a": 111}); err != nil {
+	subscribeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err = subscribe(subscribeCtx, conn)
+	cancel()
+	if err != nil {
 		return err
 	}
 
 	c.backOff.Reset()
 
-	r := newRunner(wc, c.Handler, c.notifyError)
+	r := newRunner(conn, c.Handler, c.notifyError)
 	c.runner.Store(r)
-	if err := r.runWriteLoop(ctx); err != nil {
+	if runErr := r.run(ctx); runErr != nil {
 		isShuttingDown := c.getIsShuttingDown()
 		switch {
-		case websocket.IsCloseError(err, websocket.CloseNormalClosure) && isShuttingDown:
+		case websocket.CloseStatus(runErr) == websocket.StatusNormalClosure && isShuttingDown:
 			return nil
-		case errors.Is(err, context.Canceled) || isShuttingDown:
-			return backoff.Permanent(err)
+		case errors.Is(runErr, context.Canceled) || isShuttingDown:
+			return backoff.Permanent(runErr)
 		default:
-			return err
+			return runErr
 		}
 	}
 	return nil
+}
+
+// subscribe sends the initial subscription frame the upstream service
+// expects after the WebSocket handshake.
+func subscribe(ctx context.Context, conn *websocket.Conn) error {
+	const payload = `{"a":111}`
+	return conn.Write(ctx, websocket.MessageText, []byte(payload))
 }
 
 // Shutdown shuts the client down cleanly and prevents it from
@@ -106,16 +131,22 @@ func (c *Client) Shutdown() {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	if r := c.runner.Load(); r != nil && !c.isShuttingDown {
-		c.isShuttingDown = true
-		r.shutdown()
+	if c.isShuttingDown {
+		return
+	}
+	c.isShuttingDown = true
+	if r := c.runner.Load(); r != nil {
+		_ = r.conn.Close(websocket.StatusNormalClosure, "")
 	}
 }
 
 // Run runs the given client, connecting to the lightning events
-// source server and tries to keep the connection alive.  Calls
+// source server and tries to keep the connection alive. Calls
 // Handler.HandleStrike for incoming events.
 func (c *Client) Run(ctx context.Context, dialer Dialer) error {
+	if dialer == nil {
+		dialer = DefaultDialer
+	}
 	c.backOff = backoff.NewExponentialBackOff()
 
 	return backoff.RetryNotify(func() error {

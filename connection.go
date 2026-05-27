@@ -18,145 +18,53 @@ package blitzortungc
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net"
+	"errors"
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
 )
 
 const (
+	// pongWait bounds how long we'll wait for a ping reply (or any
+	// other traffic) before considering the connection dead.
 	pongWait = 60 * time.Second
 
+	// pingPeriod is how often, in the absence of incoming traffic, we
+	// send an application-level ping to keep the connection alive.
 	pingPeriod = pongWait / 12
 
-	writeWait = 3 * time.Second
+	// readLimit caps incoming WebSocket messages. Strikes inflate to
+	// at most a few KiB; 64 KiB is comfortably above that.
+	readLimit = 64 * 1024
 )
-
-type wsConn interface {
-	io.Closer
-	WriteControl(mType int, data []byte, deadline time.Time) error
-	SetWriteDeadline(t time.Time) error
-	ReadMessage() (messageType int, p []byte, err error)
-	SetReadDeadline(t time.Time) error
-	SetReadLimit(limit int64)
-	SetPingHandler(h func(appData string) error)
-	SetPongHandler(h func(appData string) error)
-}
-
-type messageWriter func() error
 
 type errorFn func(err error)
 
 // runner represents and handles a single connection.
 type runner struct {
-	wsConn  wsConn
+	conn    *websocket.Conn
 	handler Handler
 	errorFn errorFn
 
-	writeCh chan messageWriter // writeCh is used to serialize writes to the websocket from goroutines.
-	errorCh chan error
-
-	// nextPingUnixNano is the deadline (as Unix nanoseconds) at which
-	// the next keepalive ping should be issued if no traffic arrives
-	// before then.
-	nextPingUnixNano atomic.Int64
+	// lastTrafficUnixNano is updated on every successful read or
+	// ping. The ping loop uses it to skip pinging when traffic has
+	// arrived recently.
+	lastTrafficUnixNano atomic.Int64
 }
 
-func (r *runner) writeControl(mType int, data []byte) error {
-	return r.wsConn.WriteControl(mType, data, time.Now().Add(writeWait))
-}
-
-// rearmPingTimer sets the next ping attempt to pingPeriod time in the future.
-func (r *runner) rearmPingTimer() {
-	r.nextPingUnixNano.Store(time.Now().Add(pingPeriod).UnixNano())
-}
-
-// checkPing checks whenever the connection has been stale for too long
-// and checks if the server is still reachable in case.
-func (r *runner) checkPing() error {
-	if time.Now().UnixNano() < r.nextPingUnixNano.Load() {
-		return nil
+func newRunner(conn *websocket.Conn, handler Handler, errorFn errorFn) *runner {
+	r := &runner{
+		conn:    conn,
+		handler: handler,
+		errorFn: errorFn,
 	}
-
-	// Haven't heard from the server in a while, try pinging it.
-	if err := r.writeControl(websocket.PingMessage, nil); err != nil {
-		return err
-	}
-
-	r.rearmPingTimer()
-	return nil
+	r.markTraffic()
+	return r
 }
 
-// runReadLoop runs the websocket reading loop and acts on incoming messages.
-func (r *runner) runReadLoop() error {
-	r.wsConn.SetReadLimit(0xffff)
-
-	r.wsConn.SetPongHandler(func(string) error {
-		r.rearmPingTimer()
-		return r.wsConn.SetReadDeadline(time.Now().Add(pongWait))
-	})
-
-	r.wsConn.SetPingHandler(func(m string) error {
-		r.rearmPingTimer()
-		err := r.writeControl(websocket.PongMessage, []byte(m))
-		if err == websocket.ErrCloseSent {
-			return nil
-		}
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			return nil
-		}
-		return err
-	})
-
-	for {
-		if err := r.wsConn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
-			return err
-		}
-
-		if _, data, err := r.wsConn.ReadMessage(); err != nil {
-			return err
-		} else {
-			// We received a message, this is as good as a pong,
-			// reset the Ping timer.
-			r.rearmPingTimer()
-
-			inflated := Inflate(data)
-			val := &Strike{}
-			if err := json.Unmarshal(inflated, val); err != nil {
-				r.notifyError(&UnmarshalError{
-					Wrapped: err,
-					RawData: inflated,
-				})
-				continue
-			}
-
-			r.handler.HandleStrike(val)
-		}
-	}
-}
-
-// runWriteLoop runs the writer loop.
-func (r *runner) runWriteLoop(ctx context.Context) error {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case f := <-r.writeCh:
-			if err := f(); err != nil {
-				return err
-			}
-		case <-ticker.C:
-			if err := r.checkPing(); err != nil {
-				return err
-			}
-		case err := <-r.errorCh:
-			return err
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+func (r *runner) markTraffic() {
+	r.lastTrafficUnixNano.Store(time.Now().UnixNano())
 }
 
 func (r *runner) notifyError(err error) {
@@ -165,45 +73,91 @@ func (r *runner) notifyError(err error) {
 	}
 }
 
-// shutdown shuts the client down cleanly.
-func (r *runner) shutdown() {
-	// Cleanly close the connection by sending a close message and then
-	// wait (with timeout) for the server to close the connection. The
-	// close frame is written directly: WriteControl is concurrency-safe
-	// with other writers, so we don't need to round-trip through the
-	// write loop (which may already have exited).
-	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-	if err := r.writeControl(websocket.CloseMessage, closeMsg); err != nil {
-		// Sending the close frame failed; force the conn shut so the
-		// read loop unblocks and the write loop can exit.
-		_ = r.wsConn.Close()
-		return
-	}
+// runReadLoop consumes incoming messages until the connection errors out.
+func (r *runner) runReadLoop(ctx context.Context) error {
+	for {
+		_, data, err := r.conn.Read(ctx)
+		if err != nil {
+			return err
+		}
+		r.markTraffic()
 
-	// Wait for the server's close ack (which surfaces as the read loop
-	// terminating and feeding errorCh) or time out. errorCh is buffered
-	// and closed by the read goroutine, so this receive always returns.
-	select {
-	case <-r.errorCh:
-	case <-time.After(2 * time.Second):
-		_ = r.wsConn.Close()
+		inflated := Inflate(data)
+		val := &Strike{}
+		if err := json.Unmarshal(inflated, val); err != nil {
+			r.notifyError(&UnmarshalError{
+				Wrapped: err,
+				RawData: inflated,
+			})
+			continue
+		}
+		r.handler.HandleStrike(val)
 	}
 }
 
-func newRunner(wsConn wsConn, handler Handler, errorFn errorFn) *runner {
-	c := &runner{
-		wsConn:  wsConn,
-		handler: handler,
-		errorFn: errorFn,
-		writeCh: make(chan messageWriter),
-		errorCh: make(chan error, 1),
+// runPingLoop issues keepalive pings when no traffic has arrived for
+// pingPeriod. Each ping is bounded by pongWait via a sub-context;
+// coder/websocket's Ping returns once the matching pong arrives.
+func (r *runner) runPingLoop(ctx context.Context) error {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case now := <-ticker.C:
+			last := time.Unix(0, r.lastTrafficUnixNano.Load())
+			if now.Sub(last) < pingPeriod {
+				continue
+			}
+			pingCtx, cancel := context.WithTimeout(ctx, pongWait)
+			err := r.conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				return err
+			}
+			r.markTraffic()
+		}
 	}
-	c.rearmPingTimer()
+}
 
-	go func() {
-		defer close(c.errorCh)
-		c.errorCh <- c.runReadLoop()
-	}()
+// run drives the read and ping loops in tandem. It returns when either
+// loop terminates (graceful close, ctx cancel, or transport error),
+// canceling the other loop and waiting for it to unwind so the conn
+// can be closed cleanly afterwards.
+func (r *runner) run(ctx context.Context) error {
+	r.conn.SetReadLimit(readLimit)
 
-	return c
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- r.runReadLoop(ctx) }()
+	go func() { errCh <- r.runPingLoop(ctx) }()
+
+	first := <-errCh
+	cancel()
+	second := <-errCh
+
+	// Prefer the most informative error: a CloseError reported by the
+	// read loop usually carries the server's status code, which the
+	// caller may want to inspect. Otherwise return whichever isn't
+	// a context error.
+	return pickError(first, second)
+}
+
+func pickError(a, b error) error {
+	for _, e := range []error{a, b} {
+		if e == nil {
+			continue
+		}
+		if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
+			continue
+		}
+		return e
+	}
+	if a != nil {
+		return a
+	}
+	return b
 }
