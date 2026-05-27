@@ -21,5 +21,5 @@ import (
 
 type AtomicValue[T any] struct{ v atomic.Value }
 
-func (a *AtomicValue[T]) Load() T   { return a.v.Load().(T) }
+func (a *AtomicValue[T]) Load() T   { v, _ := a.v.Load().(T); return v }
 func (a *AtomicValue[T]) Store(v T) { a.v.Store(v) }
