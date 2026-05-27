@@ -187,7 +187,7 @@ func newRunner(wsConn wsConn, handler Handler, errorFn errorFn) *runner {
 		handler: handler,
 		errorFn: errorFn,
 		writeCh: make(chan messageWriter),
-		errorCh: make(chan error),
+		errorCh: make(chan error, 1),
 	}
 	c.rearmPingTimer()
 
