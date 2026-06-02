@@ -1,0 +1,40 @@
+---
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version:
+          - '1.24.x'
+          - '1.25.x'
+          - '1.26.x'
+
+    env:
+      GOTOOLCHAIN: local
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache-dependency-path: go.sum
+
+      - name: Show Go version
+        run: go version
+
+      - name: Verify module graph
+        run: go list -m -mod=readonly all
+
+      - name: Run tests
+        run: go test -v -race ./...
