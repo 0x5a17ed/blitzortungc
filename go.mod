@@ -3,7 +3,7 @@ module github.com/0x5a17ed/blitzortungc
 go 1.24.0
 
 require (
-	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/coder/websocket v1.8.14
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c
 	github.com/stretchr/testify v1.11.1

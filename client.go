@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/coder/websocket"
 
 	"github.com/0x5a17ed/blitzortungc/internal/upstream"
@@ -66,7 +66,11 @@ var UserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like
 
 // DefaultDialer is the Dialer used when none is configured: it calls
 // websocket.Dial with the package-level UserAgent applied.
-var DefaultDialer Dialer = dialerFunc(func(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error) {
+var DefaultDialer Dialer = dialerFunc(func(ctx context.Context, urlStr string) (
+	*websocket.Conn,
+	*http.Response,
+	error,
+) {
 	return websocket.Dial(ctx, urlStr, &websocket.DialOptions{
 		HTTPHeader: http.Header{"User-Agent": []string{UserAgent}},
 	})
@@ -208,9 +212,15 @@ func (c *Client) Run(ctx context.Context, dialer Dialer) error {
 	c.backOff = backoff.NewExponentialBackOff()
 	c.resolveConfig(ctx)
 
-	return backoff.RetryNotify(func() error {
-		return c.runOnce(ctx, dialer)
-	}, c.backOff, func(err error, _ time.Duration) {
-		c.notifyError(err)
-	})
+	_, err := backoff.Retry(
+		ctx,
+		func() (struct{}, error) {
+			return struct{}{}, c.runOnce(ctx, dialer)
+		},
+		backoff.WithBackOff(c.backOff),
+		backoff.WithNotify(func(err error, _ time.Duration) {
+			c.notifyError(err)
+		}),
+	)
+	return err
 }
